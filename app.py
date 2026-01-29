@@ -5,6 +5,9 @@ from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
+# -----------------------------
+# ENV VARS (set in Render)
+# -----------------------------
 OANDA_TOKEN = os.environ.get("OANDA_TOKEN", "")
 OANDA_ACCOUNT_ID = os.environ.get("OANDA_ACCOUNT_ID", "")
 OANDA_ENV = os.environ.get("OANDA_ENV", "practice").lower()  # "practice" or "live"
@@ -19,43 +22,58 @@ INSTRUMENT_MAP = {
 }
 
 def oanda_base_url():
-    return "https://api-fxtrade.oanda.com" if OANDA_ENV == "live" else "https://api-fxpractice.oanda.com"
+    if OANDA_ENV == "live":
+        return "https://api-fxtrade.oanda.com"
+    return "https://api-fxpractice.oanda.com"
 
-def oanda_base_url():
-    return {"Authorization": f"Bearer {OANDA_TOKEN}", "Content-Type": "application/json"}
+def oanda_headers():
+    return {
+        "Authorization": "Bearer " + OANDA_TOKEN,
+        "Content-Type": "application/json",
+    }
 
 def pip_size_for(instrument):
-    return 0.01 if instrument.endswith("JPY") else 0.0001
+    # EUR_USD pip = 0.0001, JPY pairs usually 0.01
+    if instrument.endswith("JPY"):
+        return 0.01
+    return 0.0001
 
-def close_opposite_position(instrument: str, desired_side: str) -> None:
+def close_opposite_position(instrument, desired_side):
+    """
+    desired_side:
+      "buy"  -> close any shorts
+      "sell" -> close any longs
+    """
     url = f"{oanda_base_url()}/v3/accounts/{OANDA_ACCOUNT_ID}/positions/{instrument}/close"
     payload = {"shortUnits": "ALL"} if desired_side == "buy" else {"longUnits": "ALL"}
 
     try:
         r = requests.put(url, headers=oanda_headers(), data=json.dumps(payload), timeout=10)
-        print("close_opposite_position", instrument, desired_side, r.status_code, r.text[:200])
+        print("close_opposite_position:", r.status_code, r.text[:200])
     except Exception as e:
         print("close_opposite_position error:", str(e))
 
-def place_market_order(instrument: str, units: int, sl_pips: float, tp_pips: float) -> dict:
-    # Get a mid price so we can compute SL/TP price levels
-    price_url = f"{oanda_base_url()}/v3/accounts/{OANDA_ACCOUNT_ID}/pricing"
-    pr = requests.get(price_url, headers=oanda_headers(), params={"instruments": instrument}, timeout=10)
-    pr.raise_for_status()
-
-    prices = pr.json().get("prices", [])
+def get_mid_price(instrument):
+    url = f"{oanda_base_url()}/v3/accounts/{OANDA_ACCOUNT_ID}/pricing"
+    r = requests.get(url, headers=oanda_headers(), params={"instruments": instrument}, timeout=10)
+    r.raise_for_status()
+    prices = r.json().get("prices", [])
     if not prices:
         raise RuntimeError("No pricing data returned from OANDA.")
 
     bid = float(prices[0]["bids"][0]["price"])
     ask = float(prices[0]["asks"][0]["price"])
-    mid = (bid + ask) / 2.0
+    return (bid + ask) / 2.0
 
+def place_market_order(instrument, units, sl_pips, tp_pips):
+    mid = get_mid_price(instrument)
     pip = pip_size_for(instrument)
-    if units > 0:  # buy / long
+
+    # units > 0 => buy/long, units < 0 => sell/short
+    if units > 0:
         sl_price = mid - (sl_pips * pip)
         tp_price = mid + (tp_pips * pip)
-    else:         # sell / short
+    else:
         sl_price = mid + (sl_pips * pip)
         tp_price = mid - (tp_pips * pip)
 
@@ -87,7 +105,7 @@ def webhook():
         return jsonify({"ok": False, "error": "Unauthorized"}), 401
 
     if not OANDA_TOKEN or not OANDA_ACCOUNT_ID:
-        return jsonify({"ok": False, "error": "Server missing OANDA config"}), 500
+        return jsonify({"ok": False, "error": "Missing OANDA env vars"}), 500
 
     data = request.get_json(silent=True) or {}
 
@@ -96,9 +114,25 @@ def webhook():
     qty = int(data.get("quantity", 0))
 
     if symbol not in INSTRUMENT_MAP:
-        return jsonify({"ok": False, "error": f"Unsupported symbol: {symbol}"}), 400
-
+        return jsonify({"ok": False, "error": "Unsupported symbol: " + symbol}), 400
     if action not in ("buy", "sell"):
-        return jsonify({"ok": False, "error": f"Invalid action: {action}"}), 400
+        return jsonify({"ok": False, "error": "Invalid action: " + action}), 400
+    if qty <= 0:
+        return jsonify({"ok": False, "error": "quantity must be > 0"}), 400
 
-    if
+    sl_pips = float(data.get("sl_pips", DEFAULT_SL_PIPS))
+    tp_pips = float(data.get("tp_pips", DEFAULT_TP_PIPS))
+
+    instrument = INSTRUMENT_MAP[symbol]
+
+    # Close opposite side to avoid accidental hedging
+    close_opposite_position(instrument, action)
+
+    units = qty if action == "buy" else -qty
+
+    try:
+        resp = place_market_order(instrument, units, sl_pips, tp_pips)
+        return jsonify({"ok": True, "instrument": instrument, "action": action, "units": units, "oanda": resp})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
