@@ -18,13 +18,13 @@ INSTRUMENT_MAP = {
     "EUR_USD": "EUR_USD",
 }
 
-def oanda_base_url() -> str:
+def oanda_base_url():
     return "https://api-fxtrade.oanda.com" if OANDA_ENV == "live" else "https://api-fxpractice.oanda.com"
 
-def oanda_headers() -> dict:
+def oanda_base_url():
     return {"Authorization": f"Bearer {OANDA_TOKEN}", "Content-Type": "application/json"}
 
-def pip_size_for(instrument: str) -> float:
+def pip_size_for(instrument):
     return 0.01 if instrument.endswith("JPY") else 0.0001
 
 def close_opposite_position(instrument: str, desired_side: str) -> None:
