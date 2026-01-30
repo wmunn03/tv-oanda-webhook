@@ -41,12 +41,12 @@ def oanda_headers():
     }
 
 
-def pip_size_for(instrument):
+def pip_size_for(instrument: str) -> float:
     # EUR_USD pip = 0.0001, JPY pairs usually 0.01
     return 0.01 if instrument.endswith("JPY") else 0.0001
 
 
-def get_mid_bid_ask(instrument):
+def get_mid_bid_ask(instrument: str):
     url = f"{oanda_base_url()}/v3/accounts/{OANDA_ACCOUNT_ID}/pricing"
     r = requests.get(url, headers=oanda_headers(), params={"instruments": instrument}, timeout=10)
     r.raise_for_status()
@@ -60,21 +60,26 @@ def get_mid_bid_ask(instrument):
     return mid, bid, ask
 
 
-def pips_between(price_a, price_b, pip):
+def pips_between(price_a: float, price_b: float, pip: float) -> float:
     return abs(price_a - price_b) / pip
 
 
-def cooldown_ok(instrument):
+def cooldown_ok(instrument: str) -> bool:
     now = int(time.time())
     last = _last_trade_ts.get(instrument, 0)
     return (now - last) >= COOLDOWN_SECONDS
 
 
-def mark_trade(instrument):
+def mark_trade(instrument: str):
     _last_trade_ts[instrument] = int(time.time())
 
 
-def place_market_order(instrument, units, sl_pips, tp_pips, alert_price=None):
+def is_soft_reject(msg: str) -> bool:
+    msg = (msg or "").lower()
+    return ("cooldown active" in msg) or ("price drift too large" in msg)
+
+
+def place_market_order(instrument: str, units: int, sl_pips: float, tp_pips: float, alert_price=None):
     """
     units > 0 => buy/long, units < 0 => sell/short
     alert_price: (optional) TradingView close price captured at signal time
@@ -85,19 +90,27 @@ def place_market_order(instrument, units, sl_pips, tp_pips, alert_price=None):
     # Drift guard: if Pine sends alert_price, reject if moved too far
     if alert_price is not None:
         drift = pips_between(mid, float(alert_price), pip)
+        print(
+            f"[DRIFT] instrument={instrument} side={'BUY' if units>0 else 'SELL'} "
+            f"tv_close={float(alert_price):.5f} mid={mid:.5f} bid={bid:.5f} ask={ask:.5f} drift_pips={drift:.2f}"
+        )
         if drift > MAX_SLIPPAGE_PIPS:
-            raise RuntimeError(f"Price drift too large ({drift:.2f} pips > {MAX_SLIPPAGE_PIPS:.2f} pips). Rejecting.")
+            raise RuntimeError(
+                f"Price drift too large ({drift:.2f} pips > {MAX_SLIPPAGE_PIPS:.2f} pips). Rejecting."
+            )
+    else:
+        print(f"[PRICE] instrument={instrument} side={'BUY' if units>0 else 'SELL'} mid={mid:.5f} bid={bid:.5f} ask={ask:.5f} (no alert_price)")
 
     # Build SL/TP using CURRENT mid
     if units > 0:
         sl_price = mid - (sl_pips * pip)
         tp_price = mid + (tp_pips * pip)
-        # For a BUY market order, worst case is higher fill; bound near ask
+        # BUY: worst fill is higher; cap near ask
         price_bound = ask + (MAX_SLIPPAGE_PIPS * pip)
     else:
         sl_price = mid + (sl_pips * pip)
         tp_price = mid - (tp_pips * pip)
-        # For a SELL market order, worst case is lower fill; bound near bid
+        # SELL: worst fill is lower; cap near bid
         price_bound = bid - (MAX_SLIPPAGE_PIPS * pip)
 
     order_payload = {
@@ -106,7 +119,7 @@ def place_market_order(instrument, units, sl_pips, tp_pips, alert_price=None):
             "instrument": instrument,
             "units": str(units),
             "timeInForce": "FOK",
-            # Key change: lets OANDA reduce/flip without a separate "close opposite" call
+            # Key change: lets OANDA reduce/flip without a separate close call
             "positionFill": "REDUCE_FIRST",
             # Key change: prevent terrible fills
             "priceBound": f"{price_bound:.5f}",
@@ -117,6 +130,7 @@ def place_market_order(instrument, units, sl_pips, tp_pips, alert_price=None):
 
     url = f"{oanda_base_url()}/v3/accounts/{OANDA_ACCOUNT_ID}/orders"
     r = requests.post(url, headers=oanda_headers(), data=json.dumps(order_payload), timeout=10)
+    print(f"[OANDA] status={r.status_code} resp={r.text[:250]}")
     r.raise_for_status()
     return r.json()
 
@@ -128,10 +142,12 @@ def health():
 
 @app.post("/webhook")
 def webhook():
+    # Auth via query param token
     token = request.args.get("token", "")
     if WEBHOOK_TOKEN and token != WEBHOOK_TOKEN:
         return jsonify({"ok": False, "error": "Unauthorized"}), 401
 
+    # Validate required env vars
     if not OANDA_TOKEN or not OANDA_ACCOUNT_ID:
         return jsonify({"ok": False, "error": "Missing OANDA env vars"}), 500
 
@@ -155,7 +171,9 @@ def webhook():
 
     # Step 1: server-side cooldown
     if not cooldown_ok(instrument):
-        return jsonify({"ok": False, "error": f"Cooldown active ({COOLDOWN_SECONDS}s). Skipping."}), 200
+        msg = f"Cooldown active ({COOLDOWN_SECONDS}s). Skipping."
+        print(f"[SOFT_REJECT] {msg} instrument={instrument}")
+        return jsonify({"ok": False, "error": msg}), 200
 
     sl_pips = float(data.get("sl_pips", DEFAULT_SL_PIPS))
     tp_pips = float(data.get("tp_pips", DEFAULT_TP_PIPS))
@@ -174,7 +192,16 @@ def webhook():
             "tp_pips": tp_pips,
             "alert_price": alert_price,
             "oanda": resp
-        })
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 200
+        }), 200
 
+    except Exception as e:
+        msg = str(e)
+
+        # Soft rejects (intentional skips) return 200 so TV doesn’t retry/spam
+        if is_soft_reject(msg):
+            print(f"[SOFT_REJECT] {msg}")
+            return jsonify({"ok": False, "error": msg}), 200
+
+        # Real failures return 500 so you notice immediately
+        print(f"[ERROR] {msg}")
+        return jsonify({"ok": False, "error": msg}), 500
