@@ -1,5 +1,7 @@
 import os, json, time, requests
 from flask import Flask, request, jsonify
+from datetime import datetime, timezone
+import threading
 
 app = Flask(__name__)
 
@@ -8,26 +10,27 @@ app = Flask(__name__)
 # -----------------------------
 OANDA_TOKEN      = os.environ.get("OANDA_TOKEN", "")
 OANDA_ACCOUNT_ID = os.environ.get("OANDA_ACCOUNT_ID", "")
-OANDA_ENV        = os.environ.get("OANDA_ENV", "practice").lower()  # "practice" or "live"
+OANDA_ENV        = os.environ.get("OANDA_ENV", "practice").lower()
 WEBHOOK_TOKEN    = os.environ.get("WEBHOOK_TOKEN", "")
 
 DEFAULT_QTY      = int(os.environ.get("DEFAULT_QTY", "1000"))
-DEFAULT_SL_PIPS  = float(os.environ.get("DEFAULT_SL_PIPS", "5"))
-DEFAULT_TP_PIPS  = float(os.environ.get("DEFAULT_TP_PIPS", "10"))
+DEFAULT_SL_PIPS  = float(os.environ.get("DEFAULT_SL_PIPS", "25"))
+DEFAULT_TP_PIPS  = float(os.environ.get("DEFAULT_TP_PIPS", "50"))
 
-# Event-stack behavior
-AND_WINDOW_SECONDS = int(os.environ.get("AND_WINDOW_SECONDS", "600"))  # 10 minutes
-REQUIRE_BOTH_CONFIRMATIONS = os.environ.get("REQUIRE_BOTH_CONFIRMATIONS", "true").lower() in ("1","true","yes")
-REVERSE_ON_FLIP = os.environ.get("REVERSE_ON_FLIP", "true").lower() in ("1","true","yes")
+# Time window (UTC, format "HH:MM")
+TRADE_WINDOW_START = os.environ.get("TRADE_WINDOW_START", "08:00")
+TRADE_WINDOW_END   = os.environ.get("TRADE_WINDOW_END", "15:00")
+CLOSE_ALL_BY       = os.environ.get("CLOSE_ALL_BY", "17:00")
 
 # Risk model
-USE_ATR_STOPS = os.environ.get("USE_ATR_STOPS", "true").lower() in ("1","true","yes")
-ATR_SL_MULT   = float(os.environ.get("ATR_SL_MULT", "1.2"))
+USE_ATR_STOPS = os.environ.get("USE_ATR_STOPS", "true").lower() in ("1", "true", "yes")
+ATR_SL_MULT   = float(os.environ.get("ATR_SL_MULT", "1.5"))
 ATR_TP_MULT   = float(os.environ.get("ATR_TP_MULT", "2.0"))
+ATR_PERIOD    = int(os.environ.get("ATR_PERIOD", "14"))
 
 # Execution guards
-MAX_SLIPPAGE_PIPS = float(os.environ.get("MAX_SLIPPAGE_PIPS", "1.5"))
-COOLDOWN_SECONDS  = int(os.environ.get("COOLDOWN_SECONDS", "60"))
+MAX_SLIPPAGE_PIPS = float(os.environ.get("MAX_SLIPPAGE_PIPS", "3.0"))
+COOLDOWN_SECONDS  = int(os.environ.get("COOLDOWN_SECONDS", "300"))
 
 INSTRUMENT_MAP = {
     "EURUSD": "EUR_USD",
@@ -35,9 +38,11 @@ INSTRUMENT_MAP = {
     "OANDA:EURUSD": "EUR_USD",
 }
 
-_last_trade_ts = {}     # instrument -> epoch seconds
-_state = {}             # instrument -> {atr_ok, atr_pips, so, osc, ts_*}
+_last_trade_ts = {}
 
+# -----------------------------
+# OANDA HELPERS
+# -----------------------------
 def oanda_base_url():
     return "https://api-fxtrade.oanda.com" if OANDA_ENV == "live" else "https://api-fxpractice.oanda.com"
 
@@ -47,6 +52,45 @@ def oanda_headers():
 def pip_size_for(instrument: str) -> float:
     return 0.01 if instrument.endswith("JPY") else 0.0001
 
+# -----------------------------
+# TIME WINDOW HELPERS
+# -----------------------------
+def parse_time(t_str: str):
+    """Parse HH:MM string to (hour, minute) tuple"""
+    parts = t_str.strip().split(":")
+    return int(parts[0]), int(parts[1])
+
+def is_within_trade_window() -> bool:
+    """Check if current UTC time is within TRADE_WINDOW_START and TRADE_WINDOW_END"""
+    now = datetime.now(timezone.utc)
+    
+    # Skip weekends
+    if now.weekday() >= 5:
+        return False
+    
+    start_h, start_m = parse_time(TRADE_WINDOW_START)
+    end_h, end_m = parse_time(TRADE_WINDOW_END)
+    
+    start_mins = start_h * 60 + start_m
+    end_mins = end_h * 60 + end_m
+    now_mins = now.hour * 60 + now.minute
+    
+    if start_mins <= end_mins:
+        return start_mins <= now_mins <= end_mins
+    else:
+        return now_mins >= start_mins or now_mins <= end_mins
+
+def is_past_close_time() -> bool:
+    """Check if current UTC time is past CLOSE_ALL_BY"""
+    now = datetime.now(timezone.utc)
+    close_h, close_m = parse_time(CLOSE_ALL_BY)
+    close_mins = close_h * 60 + close_m
+    now_mins = now.hour * 60 + now.minute
+    return now_mins >= close_mins
+
+# -----------------------------
+# OANDA DATA FUNCTIONS
+# -----------------------------
 def get_mid_bid_ask(instrument: str):
     url = f"{oanda_base_url()}/v3/accounts/{OANDA_ACCOUNT_ID}/pricing"
     r = requests.get(url, headers=oanda_headers(), params={"instruments": instrument}, timeout=10)
@@ -59,6 +103,72 @@ def get_mid_bid_ask(instrument: str):
     mid = (bid + ask) / 2.0
     return mid, bid, ask
 
+def fetch_atr(instrument: str, granularity: str = "H1", period: int = 14) -> float:
+    """Fetch candles from OANDA and calculate ATR"""
+    url = f"{oanda_base_url()}/v3/instruments/{instrument}/candles"
+    params = {
+        "granularity": granularity,
+        "count": period + 1,
+        "price": "M"
+    }
+    r = requests.get(url, headers=oanda_headers(), params=params, timeout=10)
+    r.raise_for_status()
+    candles = r.json().get("candles", [])
+    
+    if len(candles) < period + 1:
+        return None
+    
+    true_ranges = []
+    for i in range(1, len(candles)):
+        curr = candles[i]["mid"]
+        prev = candles[i-1]["mid"]
+        
+        high = float(curr["h"])
+        low = float(curr["l"])
+        prev_close = float(prev["c"])
+        
+        tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+        true_ranges.append(tr)
+    
+    atr = sum(true_ranges[-period:]) / period
+    return atr
+
+def get_open_trades(instrument: str = None):
+    """Get open trades, optionally filtered by instrument"""
+    url = f"{oanda_base_url()}/v3/accounts/{OANDA_ACCOUNT_ID}/openTrades"
+    r = requests.get(url, headers=oanda_headers(), timeout=10)
+    r.raise_for_status()
+    trades = r.json().get("trades", [])
+    
+    if instrument:
+        trades = [t for t in trades if t["instrument"] == instrument]
+    
+    return trades
+
+def close_trade(trade_id: str):
+    """Close a specific trade"""
+    url = f"{oanda_base_url()}/v3/accounts/{OANDA_ACCOUNT_ID}/trades/{trade_id}/close"
+    r = requests.put(url, headers=oanda_headers(), timeout=10)
+    r.raise_for_status()
+    return r.json()
+
+def close_all_positions():
+    """Close all open trades"""
+    trades = get_open_trades()
+    results = []
+    for t in trades:
+        try:
+            result = close_trade(t["id"])
+            results.append({"trade_id": t["id"], "instrument": t["instrument"], "result": "closed"})
+            print(f"[AUTO_CLOSE] Closed trade {t['id']} on {t['instrument']}")
+        except Exception as e:
+            print(f"[AUTO_CLOSE_ERROR] Failed to close {t['id']}: {e}")
+            results.append({"trade_id": t["id"], "error": str(e)})
+    return results
+
+# -----------------------------
+# TRADE HELPERS
+# -----------------------------
 def pips_between(a: float, b: float, pip: float) -> float:
     return abs(a - b) / pip
 
@@ -71,27 +181,17 @@ def mark_trade(instrument: str):
     _last_trade_ts[instrument] = int(time.time())
 
 def safe_json():
-    """
-    TradingView sometimes sends text/plain; sometimes invalid JSON if alert message is wrong.
-    We try hard to parse, and log raw body if not parseable.
-    """
     data = request.get_json(silent=True)
     if data is not None:
         return data, None
 
     raw = request.data.decode("utf-8", errors="replace").strip()
     if not raw:
-        return None, "empty body (alert message likely blank / not JSON)"
+        return None, "empty body"
     try:
         return json.loads(raw), None
     except Exception as e:
-        return None, f"invalid JSON body: {str(e)} | raw={raw[:200]}"
-
-def compute_sl_tp_pips(payload: dict):
-    # payload can include sl_pips/tp_pips; otherwise use ATR if available; else defaults
-    sl_pips = float(payload.get("sl_pips", DEFAULT_SL_PIPS))
-    tp_pips = float(payload.get("tp_pips", DEFAULT_TP_PIPS))
-    return sl_pips, tp_pips
+        return None, f"invalid JSON: {str(e)}"
 
 def place_market_order(instrument: str, units: int, sl_pips: float, tp_pips: float, alert_price=None):
     mid, bid, ask = get_mid_bid_ask(instrument)
@@ -99,13 +199,10 @@ def place_market_order(instrument: str, units: int, sl_pips: float, tp_pips: flo
 
     if alert_price is not None:
         drift = pips_between(mid, float(alert_price), pip)
-        print(f"[DRIFT] instrument={instrument} side={'BUY' if units>0 else 'SELL'} tv_close={float(alert_price):.5f} mid={mid:.5f} drift_pips={drift:.2f}")
+        print(f"[DRIFT] instrument={instrument} side={'BUY' if units>0 else 'SELL'} alert={float(alert_price):.5f} mid={mid:.5f} drift={drift:.2f}")
         if drift > MAX_SLIPPAGE_PIPS:
-            raise RuntimeError(f"Price drift too large ({drift:.2f} pips > {MAX_SLIPPAGE_PIPS:.2f} pips). Rejecting.")
-    else:
-        print(f"[PRICE] instrument={instrument} side={'BUY' if units>0 else 'SELL'} mid={mid:.5f} bid={bid:.5f} ask={ask:.5f} (no alert_price)")
+            raise RuntimeError(f"Price drift too large ({drift:.2f} > {MAX_SLIPPAGE_PIPS} pips)")
 
-    # Build SL/TP from current mid
     if units > 0:
         sl_price = mid - (sl_pips * pip)
         tp_price = mid + (tp_pips * pip)
@@ -121,7 +218,7 @@ def place_market_order(instrument: str, units: int, sl_pips: float, tp_pips: flo
             "instrument": instrument,
             "units": str(units),
             "timeInForce": "FOK",
-            "positionFill": "REDUCE_FIRST" if REVERSE_ON_FLIP else "DEFAULT",
+            "positionFill": "DEFAULT",
             "priceBound": f"{price_bound:.5f}",
             "stopLossOnFill": {"price": f"{sl_price:.5f}"},
             "takeProfitOnFill": {"price": f"{tp_price:.5f}"},
@@ -130,75 +227,91 @@ def place_market_order(instrument: str, units: int, sl_pips: float, tp_pips: flo
 
     url = f"{oanda_base_url()}/v3/accounts/{OANDA_ACCOUNT_ID}/orders"
     r = requests.post(url, headers=oanda_headers(), data=json.dumps(payload), timeout=10)
-    print(f"[OANDA_ORDER] status={r.status_code} resp={r.text[:250]}")
+    print(f"[OANDA_ORDER] status={r.status_code} resp={r.text[:300]}")
     r.raise_for_status()
     return r.json()
 
-def get_state(instr: str):
-    if instr not in _state:
-        _state[instr] = {"atr_ok": False, "atr_pips": None, "so": None, "osc": None, "ts_atr": 0, "ts_so": 0, "ts_osc": 0}
-    return _state[instr]
+# -----------------------------
+# BACKGROUND AUTO-CLOSE THREAD
+# -----------------------------
+def auto_close_worker():
+    """Background thread that closes positions at CLOSE_ALL_BY time"""
+    closed_today = False
+    last_date = None
+    
+    while True:
+        time.sleep(60)
+        
+        try:
+            now = datetime.now(timezone.utc)
+            today = now.date()
+            
+            if last_date != today:
+                closed_today = False
+                last_date = today
+            
+            # Skip weekends
+            if now.weekday() >= 5:
+                continue
+            
+            if is_past_close_time() and not closed_today:
+                trades = get_open_trades()
+                if trades:
+                    print(f"[AUTO_CLOSE] Closing {len(trades)} position(s) at {now.strftime('%H:%M')} UTC")
+                    close_all_positions()
+                closed_today = True
+        except Exception as e:
+            print(f"[AUTO_CLOSE_ERROR] {e}")
 
-def within_window(ts: int) -> bool:
-    return (int(time.time()) - int(ts)) <= AND_WINDOW_SECONDS
+auto_close_thread = threading.Thread(target=auto_close_worker, daemon=True)
+auto_close_thread.start()
 
-def maybe_fire_from_stack(instrument: str, symbol: str, close_price: float):
-    s = get_state(instrument)
-
-    # Must have recent ATR_OK
-    if not (s["atr_ok"] and within_window(s["ts_atr"])):
-        return None
-
-    # Confirmation logic
-    so  = s["so"]  if within_window(s["ts_so"])  else None
-    osc = s["osc"] if within_window(s["ts_osc"]) else None
-
-    # If require both: need both and aligned direction
-    if REQUIRE_BOTH_CONFIRMATIONS:
-        if not so or not osc or so != osc:
-            return None
-        direction = so
-    else:
-        # Looser: trade if either exists; if both exist and conflict, do nothing
-        if so and osc and so != osc:
-            return None
-        direction = so or osc
-        if not direction:
-            return None
-
-    # Compute SL/TP
-    if USE_ATR_STOPS and s["atr_pips"] is not None:
-        sl_pips = max(0.1, float(s["atr_pips"]) * ATR_SL_MULT)
-        tp_pips = max(0.1, float(s["atr_pips"]) * ATR_TP_MULT)
-    else:
-        sl_pips, tp_pips = DEFAULT_SL_PIPS, DEFAULT_TP_PIPS
-
-    action = "buy" if direction == "BULL" else "sell"
-    qty = DEFAULT_QTY
-
-    return {"symbol": symbol, "action": action, "quantity": qty, "alert_price": close_price, "sl_pips": sl_pips, "tp_pips": tp_pips}
-
+# -----------------------------
+# ROUTES
+# -----------------------------
 @app.get("/")
 def health():
     return "ok"
 
 @app.get("/debug")
 def debug():
+    now_utc = datetime.now(timezone.utc)
+    
+    open_trades = []
+    try:
+        open_trades = get_open_trades()
+    except:
+        pass
+    
     return jsonify({
         "ok": True,
-        "env": {
-            "OANDA_ENV": OANDA_ENV,
-            "AND_WINDOW_SECONDS": AND_WINDOW_SECONDS,
-            "REQUIRE_BOTH_CONFIRMATIONS": REQUIRE_BOTH_CONFIRMATIONS,
-            "REVERSE_ON_FLIP": REVERSE_ON_FLIP,
-            "USE_ATR_STOPS": USE_ATR_STOPS,
+        "current_time_utc": now_utc.strftime("%Y-%m-%d %H:%M:%S"),
+        "day_of_week": now_utc.strftime("%A"),
+        "trade_window": f"{TRADE_WINDOW_START} - {TRADE_WINDOW_END} UTC",
+        "close_all_by": f"{CLOSE_ALL_BY} UTC",
+        "within_trade_window": is_within_trade_window(),
+        "past_close_time": is_past_close_time(),
+        "config": {
             "ATR_SL_MULT": ATR_SL_MULT,
             "ATR_TP_MULT": ATR_TP_MULT,
+            "ATR_PERIOD": ATR_PERIOD,
             "COOLDOWN_SECONDS": COOLDOWN_SECONDS,
+            "MAX_SLIPPAGE_PIPS": MAX_SLIPPAGE_PIPS,
+            "DEFAULT_QTY": DEFAULT_QTY,
         },
-        "state": _state,
-        "last_trade_ts": _last_trade_ts
+        "last_trade_ts": _last_trade_ts,
+        "open_trades": open_trades
     })
+
+@app.get("/close-all")
+def close_all_endpoint():
+    """Manual endpoint to close all positions"""
+    token = request.args.get("token", "")
+    if WEBHOOK_TOKEN and token != WEBHOOK_TOKEN:
+        return jsonify({"ok": False, "error": "Unauthorized"}), 401
+    
+    results = close_all_positions()
+    return jsonify({"ok": True, "closed": results})
 
 @app.post("/webhook")
 def webhook():
@@ -212,7 +325,6 @@ def webhook():
     data, err = safe_json()
     if err:
         print(f"[BAD_JSON] {err}")
-        # return 200 so TV doesn't retry forever
         return jsonify({"ok": False, "soft": True, "error": err}), 200
 
     # Normalize symbol
@@ -220,108 +332,91 @@ def webhook():
     symbol = symbol_raw.upper()
     if symbol not in INSTRUMENT_MAP:
         msg = f"Unsupported symbol: {symbol_raw}"
-        print(f"[BAD_SYMBOL] {msg} payload_keys={list(data.keys())}")
+        print(f"[BAD_SYMBOL] {msg}")
         return jsonify({"ok": False, "soft": True, "error": msg}), 200
 
     instrument = INSTRUMENT_MAP[symbol]
 
-    # Cooldown (server-side)
-    if not cooldown_ok(instrument):
-        msg = f"Cooldown active ({COOLDOWN_SECONDS}s). Skipping."
-        print(f"[SOFT_REJECT] {msg} instrument={instrument}")
+    # Check trade window
+    if not is_within_trade_window():
+        now_utc = datetime.now(timezone.utc).strftime("%H:%M")
+        msg = f"Outside trade window. Current: {now_utc} UTC, Window: {TRADE_WINDOW_START}-{TRADE_WINDOW_END} UTC"
+        print(f"[WINDOW_REJECT] {msg}")
         return jsonify({"ok": False, "soft": True, "error": msg}), 200
 
-    # ---- Mode A: direct order payload (buy/sell) ----
-    if "action" in data:
-        action = str(data.get("action", "")).lower()
-        qty = int(data.get("quantity", 0) or 0)
-        alert_price = data.get("alert_price", None)
+    # Check if past close time
+    if is_past_close_time():
+        msg = f"Past daily close time ({CLOSE_ALL_BY} UTC). No new trades."
+        print(f"[CLOSE_REJECT] {msg}")
+        return jsonify({"ok": False, "soft": True, "error": msg}), 200
 
-        if action not in ("buy", "sell") or qty <= 0:
-            msg = f"Invalid action/quantity: action={action} qty={qty}"
-            print(f"[BAD_DIRECT] {msg} data={data}")
-            return jsonify({"ok": False, "soft": True, "error": msg}), 200
+    # Cooldown check
+    if not cooldown_ok(instrument):
+        remaining = COOLDOWN_SECONDS - (int(time.time()) - _last_trade_ts.get(instrument, 0))
+        msg = f"Cooldown active. {remaining}s remaining."
+        print(f"[COOLDOWN] {msg}")
+        return jsonify({"ok": False, "soft": True, "error": msg}), 200
 
-        sl_pips, tp_pips = compute_sl_tp_pips(data)
-        units = qty if action == "buy" else -qty
-
-        try:
-            resp = place_market_order(instrument, units, sl_pips, tp_pips, alert_price=alert_price)
-            mark_trade(instrument)
-            return jsonify({"ok": True, "mode": "direct", "instrument": instrument, "action": action, "units": units, "sl_pips": sl_pips, "tp_pips": tp_pips, "oanda": resp}), 200
-        except Exception as e:
-            msg = str(e)
-            print(f"[ERROR_DIRECT] {msg}")
-            return jsonify({"ok": False, "error": msg}), 500
-
-    # ---- Mode B: LuxAlgo event stack ----
+    # Parse event type
     event_type = str(data.get("type", "")).upper()
     close_val = data.get("close", None)
 
-    if not event_type:
-        msg = f"Missing 'type' or 'action' in payload keys={list(data.keys())}"
-        print(f"[BAD_EVENT] {msg} data={data}")
-        return jsonify({"ok": False, "soft": True, "error": msg}), 200
-
-    # Parse close as float
     try:
         close_price = float(close_val) if close_val is not None else None
     except:
         close_price = None
 
-    s = get_state(instrument)
+    # Only process SO signals for intraday system
+    if event_type not in ("SO_BULL", "SO_BEAR"):
+        msg = f"Ignoring event: {event_type}. Only SO_BULL/SO_BEAR accepted."
+        print(f"[IGNORE] {msg}")
+        return jsonify({"ok": True, "note": msg}), 200
 
-    # Update state
-    now = int(time.time())
+    direction = "BULL" if event_type == "SO_BULL" else "BEAR"
+    action = "buy" if direction == "BULL" else "sell"
+    
+    print(f"[SIGNAL] {event_type} received for {instrument}")
 
-    if event_type == "ATR_OK":
-        # atrPips can be provided, otherwise we just mark atr_ok
-        atr_pips = data.get("atrPips", data.get("atr_pips", None))
+    # Calculate SL/TP using ATR from OANDA
+    if USE_ATR_STOPS:
         try:
-            s["atr_pips"] = float(atr_pips) if atr_pips is not None else s["atr_pips"]
-        except:
-            pass
-        s["atr_ok"] = True
-        s["ts_atr"] = now
-        print(f"[STACK] ATR_OK instrument={instrument} atr_pips={s['atr_pips']}")
-        return jsonify({"ok": True, "note": "Stored ATR_OK"}), 200
-
-    if event_type in ("SO_BULL", "SO_BEAR"):
-        s["so"] = "BULL" if event_type.endswith("BULL") else "BEAR"
-        s["ts_so"] = now
-        print(f"[STACK] SO={s['so']} instrument={instrument}")
-    elif event_type in ("OSC_BULL", "OSC_BEAR"):
-        s["osc"] = "BULL" if event_type.endswith("BULL") else "BEAR"
-        s["ts_osc"] = now
-        print(f"[STACK] OSC={s['osc']} instrument={instrument}")
+            atr = fetch_atr(instrument, "H1", ATR_PERIOD)
+            if atr:
+                pip = pip_size_for(instrument)
+                atr_pips = atr / pip
+                sl_pips = max(10.0, atr_pips * ATR_SL_MULT)
+                tp_pips = max(20.0, atr_pips * ATR_TP_MULT)
+                print(f"[ATR] H1 ATR={atr:.5f} ({atr_pips:.1f} pips) -> SL={sl_pips:.1f} TP={tp_pips:.1f}")
+            else:
+                sl_pips, tp_pips = DEFAULT_SL_PIPS, DEFAULT_TP_PIPS
+                print(f"[ATR] Could not calculate, using defaults: SL={sl_pips} TP={tp_pips}")
+        except Exception as e:
+            print(f"[ATR_ERROR] {e}. Using defaults.")
+            sl_pips, tp_pips = DEFAULT_SL_PIPS, DEFAULT_TP_PIPS
     else:
-        msg = f"Unknown type: {event_type}"
-        print(f"[BAD_TYPE] {msg}")
-        return jsonify({"ok": False, "soft": True, "error": msg}), 200
+        sl_pips, tp_pips = DEFAULT_SL_PIPS, DEFAULT_TP_PIPS
 
-    # Try to fire
-    if close_price is None:
-        # no close => can’t drift-guard, but can still trade if we want; we’ll pass None
-        close_price = None
-
-    order_payload = maybe_fire_from_stack(instrument, symbol, close_price if close_price is not None else None)
-    if not order_payload:
-        return jsonify({"ok": True, "note": f"Stored {event_type}, waiting for stack"}), 200
+    units = DEFAULT_QTY if action == "buy" else -DEFAULT_QTY
 
     # Place trade
-    action = order_payload["action"]
-    qty = int(order_payload["quantity"])
-    units = qty if action == "buy" else -qty
-    sl_pips = float(order_payload["sl_pips"])
-    tp_pips = float(order_payload["tp_pips"])
-    alert_price = order_payload.get("alert_price", None)
-
     try:
-        resp = place_market_order(instrument, units, sl_pips, tp_pips, alert_price=alert_price)
+        resp = place_market_order(instrument, units, sl_pips, tp_pips, alert_price=close_price)
         mark_trade(instrument)
-        print(f"[FIRED] {action.upper()} instrument={instrument} units={units} sl_pips={sl_pips:.2f} tp_pips={tp_pips:.2f}")
-        return jsonify({"ok": True, "fired": action, "instrument": instrument, "units": units, "sl_pips": sl_pips, "tp_pips": tp_pips, "oanda": resp}), 200
+        print(f"[TRADE] {action.upper()} {instrument} units={units} SL={sl_pips:.1f} TP={tp_pips:.1f}")
+        return jsonify({
+            "ok": True,
+            "action": action,
+            "instrument": instrument,
+            "units": units,
+            "sl_pips": round(sl_pips, 1),
+            "tp_pips": round(tp_pips, 1),
+            "oanda": resp
+        }), 200
     except Exception as e:
         msg = str(e)
-        print(f"[ERROR_STACK] {msg}")
+        print(f"[ERROR] {msg}")
         return jsonify({"ok": False, "error": msg}), 500
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
