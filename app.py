@@ -13,7 +13,11 @@ OANDA_ACCOUNT_ID = os.environ.get("OANDA_ACCOUNT_ID", "")
 OANDA_ENV        = os.environ.get("OANDA_ENV", "practice").lower()
 WEBHOOK_TOKEN    = os.environ.get("WEBHOOK_TOKEN", "")
 
-DEFAULT_QTY      = int(os.environ.get("DEFAULT_QTY", "1000"))
+# Risk management
+RISK_PERCENT     = float(os.environ.get("RISK_PERCENT", "2.0"))  # Percent of account to risk per trade
+MIN_UNITS        = int(os.environ.get("MIN_UNITS", "1000"))      # Minimum position size
+MAX_UNITS        = int(os.environ.get("MAX_UNITS", "50000"))     # Maximum position size
+
 DEFAULT_SL_PIPS  = float(os.environ.get("DEFAULT_SL_PIPS", "25"))
 DEFAULT_TP_PIPS  = float(os.environ.get("DEFAULT_TP_PIPS", "50"))
 
@@ -91,6 +95,14 @@ def is_past_close_time() -> bool:
 # -----------------------------
 # OANDA DATA FUNCTIONS
 # -----------------------------
+def get_account_balance() -> float:
+    """Fetch current account balance from OANDA"""
+    url = f"{oanda_base_url()}/v3/accounts/{OANDA_ACCOUNT_ID}/summary"
+    r = requests.get(url, headers=oanda_headers(), timeout=10)
+    r.raise_for_status()
+    balance = float(r.json()["account"]["balance"])
+    return balance
+
 def get_mid_bid_ask(instrument: str):
     url = f"{oanda_base_url()}/v3/accounts/{OANDA_ACCOUNT_ID}/pricing"
     r = requests.get(url, headers=oanda_headers(), params={"instruments": instrument}, timeout=10)
@@ -165,6 +177,45 @@ def close_all_positions():
             print(f"[AUTO_CLOSE_ERROR] Failed to close {t['id']}: {e}")
             results.append({"trade_id": t["id"], "error": str(e)})
     return results
+
+# -----------------------------
+# POSITION SIZING
+# -----------------------------
+def calculate_position_size(sl_pips: float, instrument: str) -> int:
+    """
+    Calculate position size based on account balance and risk percentage.
+    
+    Formula: Units = (Balance × Risk%) / (SL_Pips × Pip_Value_Per_Unit)
+    
+    For EUR/USD (quote = USD), pip value per unit = pip size (0.0001)
+    """
+    try:
+        balance = get_account_balance()
+        pip_size = pip_size_for(instrument)
+        
+        # Risk amount in dollars
+        risk_amount = balance * (RISK_PERCENT / 100.0)
+        
+        # Pip value per unit (for USD-quoted pairs, this equals pip size)
+        # For JPY pairs or non-USD quotes, this would need conversion
+        pip_value_per_unit = pip_size
+        
+        # Calculate units
+        units = risk_amount / (sl_pips * pip_value_per_unit)
+        
+        # Round down to nearest 100
+        units = int(units // 100) * 100
+        
+        # Apply min/max limits
+        units = max(MIN_UNITS, min(MAX_UNITS, units))
+        
+        print(f"[POSITION_SIZE] balance=${balance:.2f} risk={RISK_PERCENT}% (${risk_amount:.2f}) sl={sl_pips:.1f}pips -> {units} units")
+        
+        return units
+        
+    except Exception as e:
+        print(f"[POSITION_SIZE_ERROR] {e}. Using MIN_UNITS={MIN_UNITS}")
+        return MIN_UNITS
 
 # -----------------------------
 # TRADE HELPERS
@@ -277,8 +328,10 @@ def health():
 def debug():
     now_utc = datetime.now(timezone.utc)
     
+    balance = None
     open_trades = []
     try:
+        balance = get_account_balance()
         open_trades = get_open_trades()
     except:
         pass
@@ -291,13 +344,19 @@ def debug():
         "close_all_by": f"{CLOSE_ALL_BY} UTC",
         "within_trade_window": is_within_trade_window(),
         "past_close_time": is_past_close_time(),
+        "account": {
+            "balance": balance,
+            "risk_percent": RISK_PERCENT,
+            "risk_per_trade": round(balance * RISK_PERCENT / 100, 2) if balance else None,
+        },
         "config": {
             "ATR_SL_MULT": ATR_SL_MULT,
             "ATR_TP_MULT": ATR_TP_MULT,
             "ATR_PERIOD": ATR_PERIOD,
             "COOLDOWN_SECONDS": COOLDOWN_SECONDS,
             "MAX_SLIPPAGE_PIPS": MAX_SLIPPAGE_PIPS,
-            "DEFAULT_QTY": DEFAULT_QTY,
+            "MIN_UNITS": MIN_UNITS,
+            "MAX_UNITS": MAX_UNITS,
         },
         "last_trade_ts": _last_trade_ts,
         "open_trades": open_trades
@@ -396,7 +455,10 @@ def webhook():
     else:
         sl_pips, tp_pips = DEFAULT_SL_PIPS, DEFAULT_TP_PIPS
 
-    units = DEFAULT_QTY if action == "buy" else -DEFAULT_QTY
+    # Calculate position size based on risk
+    units = calculate_position_size(sl_pips, instrument)
+    if action == "sell":
+        units = -units
 
     # Place trade
     try:
@@ -407,7 +469,7 @@ def webhook():
             "ok": True,
             "action": action,
             "instrument": instrument,
-            "units": units,
+            "units": abs(units),
             "sl_pips": round(sl_pips, 1),
             "tp_pips": round(tp_pips, 1),
             "oanda": resp
